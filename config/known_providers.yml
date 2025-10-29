@@ -1,0 +1,20 @@
+# Add any networks you consider "known" — CIDRs under a label.
+# Example seed data (edit to your needs)
+- label: Cloudflare Public DNS
+  cidrs:
+    - 1.1.1.0/24
+    - 1.0.0.0/24
+
+- label: Google Public DNS
+  cidrs:
+    - 8.8.8.0/24
+    - 8.8.4.0/24
+
+- label: OpenDNS
+  cidrs:
+    - 208.67.222.0/24
+    - 208.67.220.0/24
+
+- label: Quad9
+  cidrs:
+    - 9.9.9.0/24
