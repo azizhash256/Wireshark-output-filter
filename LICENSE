@@ -1,3 +1,60 @@
+Contributing
+
+PRs welcome! Ideas: JA3/JA4 fingerprinting, HTTP/2 SNI parsing, more protocol hints, caching RDAP results.
+
+
+---
+
+# `requirements.txt`
+
+
+scapy>=2.5.0
+rich>=13.7.0
+pyyaml>=6.0.1
+ipwhois>=1.2.0
+tldextract>=5.1.2
+
+
+---
+
+# `.gitignore`
+
+Python
+
+pycache/
+*.pyc
+.venv/
+venv/
+env/
+
+Output
+
+out/
+
+OS
+
+.DS_Store
+
+
+---
+
+# `LICENSE` (MIT)
+```text
+MIT License
+
+Copyright (c) 2025 <Your Name>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+[... full MIT text ...]
+
+
+
 MIT License
 
 Copyright (c) 2025 azizhash256
