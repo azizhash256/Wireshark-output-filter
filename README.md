@@ -73,6 +73,13 @@ Flag Google DNS / Cloudflare:
 
 python ip_inspector.py samples/dns_traffic.pcap --known config/known_providers.yml --rdap
 
+## GUI
+Launch the simple GUI:
+
+```bash
+python gui.py
+
+
 
 Only print table, skip files:
 
