@@ -1,0 +1,21 @@
+# Mark IPs as related to certain sites if their observed domain (HTTP Host / SNI)
+# OR reverse-DNS matches any of these regex patterns.
+- label: Google
+  patterns:
+    - '(^|\\.)google\\.com$'
+    - '(^|\\.)gstatic\\.com$'
+    - '(^|\\.)googleapis\\.com$'
+
+- label: Cloudflare
+  patterns:
+    - '(^|\\.)cloudflare\\.com$'
+    - '(^|\\.)cloudflare-dns\\.com$'
+
+- label: GitHub
+  patterns:
+    - '(^|\\.)github\\.com$'
+    - '(^|\\.)githubusercontent\\.com$'
+
+- label: YourCompany
+  patterns:
+    - '(^|\\.)example\\.corp$'
