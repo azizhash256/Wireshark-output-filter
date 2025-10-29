@@ -2,12 +2,15 @@
 """
 TraceScout — Unique IP Extractor for Wireshark Captures
 
+Enhancements in this version:
 - Parses PCAP/PCAPNG with Scapy (IPv4/IPv6 src/dst)
 - Or parses text/CSV/JSON exports via regex
 - Best-effort HTTP Host / TLS SNI extraction (PCAP only)
+- Tracks observed ports per IP for lightweight heuristics (e.g., DoT/DoH/QUIC hints)
 - Checks IPs against known CIDR ranges + known domain patterns
-- Optional reverse DNS + RDAP org/ASN lookup
+- Optional reverse DNS + RDAP org/ASN lookup (shared engine handles caching)
 - Outputs to console + out/ips.json + out/ips.csv
+- Exposes helpers so tracescout_core.py can import and reuse logic
 """
 import argparse
 import json
@@ -15,18 +18,16 @@ import os
 import re
 import csv
 import socket
-from ipaddress import ip_address, ip_network, IPv4Address, IPv6Address
+from ipaddress import ip_address, ip_network, IPv6Address
 from collections import defaultdict
 
 from rich import print as rprint
 from rich.table import Table
 from rich.console import Console
-from rich.progress import track
 
 from scapy.all import PcapReader, TCP, UDP, Raw, IP, IPv6
 import yaml
 from ipwhois import IPWhois
-import tldextract
 
 OUT_DIR = "out"
 DEFAULT_JSON = os.path.join(OUT_DIR, "ips.json")
@@ -37,33 +38,31 @@ IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\
 IPV6_RE = re.compile(r"\b(?:(?:[A-Fa-f0-9]{1,4}:){1,7}:?|:(?::[A-Fa-f0-9]{1,4}){1,7})\b")
 
 HTTP_HOST_RE = re.compile(rb"\bHost:\s*([^\r\n]+)", re.IGNORECASE)
-# TLS SNI: parse ClientHello manually (best-effort minimal)
+
+# -----------------------------
+# TLS SNI: minimal ClientHello parse (best-effort)
+# -----------------------------
 def extract_tls_sni(payload: bytes) -> str | None:
-    # Very minimal TLS ClientHello parsing (content type 22, handshake 1)
     try:
-        if len(payload) < 5 or payload[0] != 0x16:  # TLS Handshake
+        # TLS record header: ContentType(1)=0x16 (Handshake), Version(2), Length(2)
+        if len(payload) < 5 or payload[0] != 0x16:
             return None
-        # Skip TLS record header (5 bytes)
         hs = payload[5:]
-        if len(hs) < 4 or hs[0] != 0x01:  # ClientHello
+        # Handshake type 0x01 = ClientHello
+        if len(hs) < 4 or hs[0] != 0x01:
             return None
-        # Skip fixed parts in ClientHello to reach extensions (this is simplified)
-        # Safer: search for SNI extension id (0x00 0x00) in the blob
-        # Heuristic search
-        i = 0
-        # Find "server_name" extension id bytes
+
+        # Heuristic: search for extension type 0x0000 (server_name)
         idx = hs.find(b"\x00\x00")
         while idx != -1 and idx + 7 < len(hs):
-            # ext_type(2) ext_len(2) list_len(2) name_type(1=0) name_len(2) name
             ext_len = int.from_bytes(hs[idx+2:idx+4], "big")
             ex_end = idx + 4 + ext_len
             if ex_end > len(hs):
                 break
             block = hs[idx:ex_end]
-            # try to parse list_len and name
             try:
+                # block layout: 00 00 | ext_len(2) | list_len(2) | name_type(1=0) | name_len(2) | name
                 list_len = int.from_bytes(block[4:6], "big")
-                # name_type at 6
                 if block[6] == 0:
                     name_len = int.from_bytes(block[7:9], "big")
                     name = block[9:9+name_len]
@@ -75,10 +74,13 @@ def extract_tls_sni(payload: bytes) -> str | None:
         return None
     return None
 
+# -----------------------------
+# Config loaders / matchers
+# -----------------------------
 def load_known_cidrs(path: str | None):
     if not path:
         return []
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or []
     cidr_entries = []
     for item in data:
@@ -93,7 +95,7 @@ def load_known_cidrs(path: str | None):
 def load_known_sites(path: str | None):
     if not path:
         return []
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or []
     patterns = []
     for item in data:
@@ -140,22 +142,49 @@ def rdap_lookup(ip: str) -> dict | None:
     except Exception:
         return None
 
+# -----------------------------
+# Parsers
+# -----------------------------
 def parse_pcap(path: str, limit: int | None = None):
+    """
+    Returns:
+      unique_ips: set[str]
+      ip_domains: dict[str, set[str]]    (Domains from HTTP Host / TLS SNI)
+      ports_for_ip: dict[str, set[int]]  (Observed src/dst ports per IP for heuristics)
+    """
     unique_ips: set[str] = set()
-    ip_domains: defaultdict[str, set[str]] = defaultdict(set)  # ip -> domains seen (HTTP host / SNI)
+    ip_domains: defaultdict[str, set[str]] = defaultdict(set)
+    ports_for_ip: defaultdict[str, set[int]] = defaultdict(set)
     count = 0
+
     with PcapReader(path) as pcap:
         for pkt in pcap:
             if limit and count >= limit:
                 break
             count += 1
             try:
+                src_ip, dst_ip = None, None
+                sport, dport = None, None
+
                 if IP in pkt:
-                    unique_ips.add(pkt[IP].src)
-                    unique_ips.add(pkt[IP].dst)
-                if IPv6 in pkt:
-                    unique_ips.add(pkt[IPv6].src)
-                    unique_ips.add(pkt[IPv6].dst)
+                    src_ip, dst_ip = pkt[IP].src, pkt[IP].dst
+                elif IPv6 in pkt:
+                    src_ip, dst_ip = pkt[IPv6].src, pkt[IPv6].dst
+
+                if src_ip:
+                    unique_ips.add(src_ip)
+                if dst_ip:
+                    unique_ips.add(dst_ip)
+
+                if TCP in pkt:
+                    sport, dport = int(pkt[TCP].sport), int(pkt[TCP].dport)
+                elif UDP in pkt:
+                    sport, dport = int(pkt[UDP].sport), int(pkt[UDP].dport)
+
+                if src_ip and sport:
+                    ports_for_ip[src_ip].add(sport)
+                if dst_ip and dport:
+                    ports_for_ip[dst_ip].add(dport)
 
                 if Raw in pkt:
                     payload: bytes = bytes(pkt[Raw].load)
@@ -164,53 +193,56 @@ def parse_pcap(path: str, limit: int | None = None):
                     m = HTTP_HOST_RE.search(payload)
                     if m:
                         host = m.group(1).strip().decode(errors="ignore")
-                        # Try to attach to IP endpoints for this packet
-                        if IP in pkt:
-                            ip_domains[pkt[IP].dst].add(host)
-                            ip_domains[pkt[IP].src].add(host)
-                        elif IPv6 in pkt:
-                            ip_domains[pkt[IPv6].dst].add(host)
-                            ip_domains[pkt[IPv6].src].add(host)
+                        if src_ip:
+                            ip_domains[src_ip].add(host)
+                        if dst_ip:
+                            ip_domains[dst_ip].add(host)
 
                     # TLS SNI (ClientHello)
                     sni = extract_tls_sni(payload)
-                    if sni:
-                        if IP in pkt:
-                            ip_domains[pkt[IP].dst].add(sni)
-                        elif IPv6 in pkt:
-                            ip_domains[pkt[IPv6].dst].add(sni)
+                    if sni and dst_ip:
+                        ip_domains[dst_ip].add(sni)
 
             except Exception:
                 continue
-    # clean empty strings
+
+    # Clean empties
     for k in list(ip_domains.keys()):
         ip_domains[k] = {d for d in ip_domains[k] if d}
         if not ip_domains[k]:
             del ip_domains[k]
-    return unique_ips, ip_domains
+
+    return unique_ips, ip_domains, ports_for_ip
 
 def parse_text_like(path: str):
     text = open(path, "rb").read()
     ips = set()
+    # IPv4
     for m in IPV4_RE.finditer(text.decode(errors="ignore")):
         ips.add(m.group(0))
+    # IPv6 (validate candidates)
     for m in IPV6_RE.finditer(text.decode(errors="ignore")):
         try:
-            # Validate
             ip_address(m.group(0))
             ips.add(m.group(0))
         except Exception:
             pass
     return ips
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def normalize_domain(d: str) -> str:
     d = d.strip().lower()
-    # remove trailing dot
-    if d.endswith("."):
-        d = d[:-1]
-    return d
+    return d[:-1] if d.endswith(".") else d
 
+# -----------------------------
+# CLI (delegates to shared engine)
+# -----------------------------
 def main():
+    # Use the shared engine so GUI and CLI behave identically (caching, heuristics, etc.)
+    from tracescout_core import run_tracescout
+
     ap = argparse.ArgumentParser(description="Extract unique IPs from Wireshark outputs and mark known ones.")
     ap.add_argument("input", help="Path to .pcap/.pcapng OR text/csv/json export")
     ap.add_argument("--known", help="YAML of known provider CIDRs", default="config/known_providers.yml")
@@ -219,57 +251,19 @@ def main():
     ap.add_argument("--rdap", action="store_true", help="Do RDAP whois lookups (org/ASN)")
     ap.add_argument("--limit", type=int, help="Max packets to parse (PCAP only)")
     ap.add_argument("--no-save", action="store_true", help="Do not write out/ips.json/.csv")
+    ap.add_argument("--cache-ttl", type=int, default=86400, help="Cache TTL seconds for rDNS/RDAP (default 86400)")
     args = ap.parse_args()
 
-    os.makedirs(OUT_DIR, exist_ok=True)
-
-    known_cidrs = load_known_cidrs(args.known) if args.known and os.path.exists(args.known) else []
-    known_sites = load_known_sites(args.sites) if args.sites and os.path.exists(args.sites) else []
-
-    ext = os.path.splitext(args.input)[1].lower()
-    ip_to_domains: dict[str, set[str]] = {}
-    if ext in [".pcap", ".pcapng"]:
-        rprint(f"[bold]PCAP mode[/bold]: parsing {args.input}")
-        ip_set, ip_to_domains = parse_pcap(args.input, limit=args.limit)
-    else:
-        rprint(f"[bold]Text mode[/bold]: parsing {args.input}")
-        ip_set = parse_text_like(args.input)
-
-    # Build records
-    records = []
-    for ip in sorted(ip_set, key=lambda x: (isinstance(ip_address(x), IPv6Address), ip_address(x))):
-        rec = {
-            "ip": ip,
-            "version": 6 if isinstance(ip_address(ip), IPv6Address) else 4,
-            "domains": sorted({normalize_domain(d) for d in ip_to_domains.get(ip, set())}),
-            "known_providers": [],
-            "known_sites": [],
-            "rDNS": None,
-            "rdap": None
-        }
-
-        # known memberships
-        if known_cidrs:
-            rec["known_providers"] = ip_in_known(ip, known_cidrs)
-        # sites (via mapped domains)
-        for d in rec["domains"]:
-            hits = domain_in_known(d, known_sites)
-            rec["known_sites"].extend(hits)
-        # also try rDNS domain matching if we have it
-        if args.reverse_dns:
-            rec["rDNS"] = reverse_dns(ip)
-            if rec["rDNS"]:
-                rec["known_sites"].extend(domain_in_known(rec["rDNS"], known_sites))
-
-        # RDAP
-        if args.rdap:
-            rec["rdap"] = rdap_lookup(ip)
-
-        # dedupe & sort flags
-        rec["known_providers"] = sorted(set(rec["known_providers"]))
-        rec["known_sites"] = sorted(set(rec["known_sites"]))
-
-        records.append(rec)
+    # Run
+    records = run_tracescout(
+        input_path=args.input,
+        known=args.known,
+        sites=args.sites,
+        reverse_dns=args.reverse_dns,
+        rdap=args.rdap,
+        limit=args.limit,
+        cache_ttl=args.cache_ttl,
+    )
 
     # Console table
     table = Table(show_header=True, header_style="bold")
@@ -279,53 +273,44 @@ def main():
     table.add_column("Known Providers", overflow="fold")
     table.add_column("Known Sites", overflow="fold")
     table.add_column("rDNS", overflow="fold")
-    table.add_column("ASN/Org (RDAP)", overflow="fold")
+    table.add_column("Hints", overflow="fold")
 
-    for rec in records:
-        rdap_str = ""
-        if isinstance(rec["rdap"], dict):
-            parts = []
-            if rec["rdap"].get("asn"):
-                parts.append(f"ASN {rec['rdap']['asn']}")
-            if rec["rdap"].get("asn_description"):
-                parts.append(rec["rdap"]["asn_description"])
-            if rec["rdap"].get("network"):
-                parts.append(rec["rdap"]["network"])
-            rdap_str = " | ".join(parts)
-
+    for r in records:
         table.add_row(
-            rec["ip"],
-            str(rec["version"]),
-            ", ".join(rec["domains"]) if rec["domains"] else "",
-            ", ".join(rec["known_providers"]) if rec["known_providers"] else "",
-            ", ".join(rec["known_sites"]) if rec["known_sites"] else "",
-            rec["rDNS"] or "",
-            rdap_str
+            r["ip"],
+            str(r["version"]),
+            ", ".join(r["domains"]),
+            ", ".join(r["known_providers"]),
+            ", ".join(r["known_sites"]),
+            r.get("rDNS") or "",
+            ", ".join(r.get("hints", [])),
         )
 
     Console().print(table)
 
-    if not args.no_save:
-        with open(DEFAULT_JSON, "w", encoding="utf-8") as f:
-            json.dump(records, f, ensure_ascii=False, indent=2)
-        with open(DEFAULT_CSV, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["ip", "version", "domains", "known_providers", "known_sites", "rDNS", "rdap_asn", "rdap_desc", "rdap_net"])
-            for r in records:
-                asn = (r["rdap"] or {}).get("asn") if isinstance(r.get("rdap"), dict) else ""
-                desc = (r["rdap"] or {}).get("asn_description") if isinstance(r.get("rdap"), dict) else ""
-                net = (r["rdap"] or {}).get("network") if isinstance(r.get("rdap"), dict) else ""
-                w.writerow([
-                    r["ip"], r["version"],
-                    "|".join(r["domains"]),
-                    "|".join(r["known_providers"]),
-                    "|".join(r["known_sites"]),
-                    r["rDNS"] or "",
-                    asn or "", desc or "", net or ""
-                ])
-        rprint(f"[green]Saved[/green] {DEFAULT_JSON} and {DEFAULT_CSV}")
-    else:
-        rprint("[yellow]Skipped saving files (--no-save)[/yellow]")
+    # Save
+    if args.no_save:
+        rprint("[yellow]Skipped saving files (--no-save).[/yellow]")
+        return
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(DEFAULT_JSON, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+    with open(DEFAULT_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["ip", "version", "domains", "known_providers", "known_sites", "rDNS", "hints"])
+        for r in records:
+            w.writerow([
+                r["ip"], r["version"],
+                "|".join(r["domains"]),
+                "|".join(r["known_providers"]),
+                "|".join(r["known_sites"]),
+                r.get("rDNS") or "",
+                "|".join(r.get("hints", [])),
+            ])
+
+    rprint(f"[green]Saved[/green] {DEFAULT_JSON} and {DEFAULT_CSV}")
 
 if __name__ == "__main__":
     main()
